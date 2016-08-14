@@ -81,6 +81,47 @@
 
 #include "utils.h"
 
+__global__
+void shmem_reduce_kernel(float * d_out, const float * d_in) {
+  int block_len = blockDim.x * blockDim.y;
+  
+  assert(block_len % 2 == 0);
+  
+  __shared__ float max_data[block_len];
+  __shared__ float min_data[block_len];
+  
+  int x = threadIdx.x + blockIdx.x * blockDim.x;
+  int y = threadIdx.y + blockIdx.y * blockDim.y;
+  
+  if (x >= numRows || y >= numCols) {
+    return;
+  }
+  
+  int index = y + numCols * x;
+  int idx_in_block = threadIdx.y + blockDim.y * threadIdx.x;
+  
+  max_data[idx_in_block] = d_logLuminance[index];
+  min_data[idx_in_block] = d_logLuminance[index];
+  __syncthreads();
+  
+  for (unsigned int s = block_len / 2; s > 0; s >>= 1) {
+    if (idx_in_block < s) {
+      max_data[idx_in_block] = fmaxf(max_data[idx_in_block], max_data[idx_in_block + s]);
+      min_data[idx_in_block] = fmaxf(min_data[idx_in_block], min_data[idx_in_block + s]);
+    }
+    __syncthreads();
+  }
+
+  if (s == 0) {
+
+  }
+}
+
+__global__
+void reduce(float * d_out, float * d_intermediate, float * d_in, int size) {
+
+}
+
 void your_histogram_and_prefixsum(const float* const d_logLuminance,
                                   unsigned int* const d_cdf,
                                   float &min_logLum,
@@ -99,6 +140,5 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
     4) Perform an exclusive scan (prefix sum) on the histogram to get
        the cumulative distribution of luminance values (this should go in the
        incoming d_cdf pointer which already has been allocated for you)       */
-
 
 }
