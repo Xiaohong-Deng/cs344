@@ -82,43 +82,70 @@
 #include "utils.h"
 
 __global__
-void shmem_reduce_kernel(float * d_out, const float * d_in) {
-  int block_len = blockDim.x * blockDim.y;
+void shmem_reduce_kernel(float * d_max_out, float * d_min_out, const float * d_in) {
   
-  assert(block_len % 2 == 0);
+  assert(blockDim.x % 2 == 0);
+  // according to stackoverflow, extern __shared__ array can only have one copy
+  // in order to fulfill the need of 2 array, double the size
+  extern __shared__ float max_min_data[];
   
-  __shared__ float max_data[block_len];
-  __shared__ float min_data[block_len];
+  int index = threadIdx.x + blockIdx.x * blockDim.x;
+  int idx_in_block = threadIdx.x;
   
-  int x = threadIdx.x + blockIdx.x * blockDim.x;
-  int y = threadIdx.y + blockIdx.y * blockDim.y;
-  
-  if (x >= numRows || y >= numCols) {
-    return;
-  }
-  
-  int index = y + numCols * x;
-  int idx_in_block = threadIdx.y + blockDim.y * threadIdx.x;
-  
-  max_data[idx_in_block] = d_logLuminance[index];
-  min_data[idx_in_block] = d_logLuminance[index];
+  max_min_data[idx_in_block] = d_in[index];
+  max_min_data[idx_in_block + blockDim.x] = d_in[index]
   __syncthreads();
   
-  for (unsigned int s = block_len / 2; s > 0; s >>= 1) {
+  for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
     if (idx_in_block < s) {
-      max_data[idx_in_block] = fmaxf(max_data[idx_in_block], max_data[idx_in_block + s]);
-      min_data[idx_in_block] = fmaxf(min_data[idx_in_block], min_data[idx_in_block + s]);
+      max_min_data[idx_in_block] = fmaxf(max_min_data[idx_in_block], max_min_data[idx_in_block + s]);
+      min_data[idx_in_block + blockDim.x] = fminf(max_min_data[idx_in_block + blockDim.x], max_min_data[idx_in_block + blockDim.x + s]);
     }
     __syncthreads();
   }
 
   if (s == 0) {
-
+    d_max_out[blockIdx.x] = max_data[0];
+    d_min_out[blockIdx.x] = min_data[blockDim.x];
   }
 }
 
 __global__
-void reduce(float * d_out, float * d_intermediate, float * d_in, int size) {
+void reduce(float * d_max_out,
+            float * d_min_out
+            float * d_max_intermediate,
+            float * d_min_intermediate,
+            float * d_in,
+            int size) {
+    const int maxThreadsPerBlock = 1024;
+    int threads = maxThreadsPerBlock;
+    // if size is not divisible by maxThreadPerBlock, do I need an extra block
+    int blocks = size / maxThreadsPerBlock;
+    shmem_reduce_kernel<<<blocks, threads, 2 * threads * sizeof(float)>>>
+            (d_max_intermediate, d_min_intermediate, d_in);
+    threads = blocks;
+    blocks = 1;
+    shmem_reduce_kernel<<<blocks, threads, 2 * threads * sizeof(float)>>>
+            (d_max_out, d_min_out, d_intermediate);
+}
+
+__global__
+void find_max_and_min(float * d_in, float * global_max, float * global_min,
+                      size_t numRows, size_t numCols) {
+  const int ARRAY_SIZE = numRows * numCols;
+  const int ARRAY_BYTES = ARRAY_SIZE * sizeof(float);
+  float *d_max_intermediate, *d_min_intermediate;
+
+  checkCudaErrors(cudaMalloc((void **) &d_max_intermediate, ARRAY_BYTES));
+  checkCudaErrors(cudaMalloc((void **) &d_min_intermediate, ARRAY_BYTES));
+
+  reduce(global_max, global_min, d_max_intermediate, d_min_intermediate, d_in, ARRAY_SIZE);
+
+  checkCudaErrors(cudaFree(d_max_intermediate));
+  checkCudaErrors(cudaFree(d_min_intermediate));
+}
+
+void scatter_kernel(const float * d_in, const size_t numBins, const float lumRange, int *d_bins) {
 
 }
 
@@ -140,5 +167,8 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
     4) Perform an exclusive scan (prefix sum) on the histogram to get
        the cumulative distribution of luminance values (this should go in the
        incoming d_cdf pointer which already has been allocated for you)       */
+  find_max_and_min(d_logLuminance, &max_logLum, &min_logLum, numRows, numCols);
+
+  float lumRange = max_logLum - min_logLum;
 
 }
