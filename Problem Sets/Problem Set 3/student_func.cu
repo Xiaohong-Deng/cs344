@@ -82,7 +82,7 @@
 #include "utils.h"
 
 __global__
-void shmem_reduce_kernel(float * d_max_min_out, const float * d_in) {
+void shmem_reduce_kernel(float * d_max_min_out, const float * d_in, int size) {
   
   // assert(blockDim.x % 2 == 0);
   // according to stackoverflow, extern __shared__ array can only have one copy
@@ -92,8 +92,10 @@ void shmem_reduce_kernel(float * d_max_min_out, const float * d_in) {
   int index = threadIdx.x + blockIdx.x * blockDim.x;
   int idx_in_block = threadIdx.x;
   
+  if (index >= size) return;
+
   max_min_data[idx_in_block] = d_in[index];
-  max_min_data[idx_in_block + blockDim.x] = d_in[index]
+  max_min_data[idx_in_block + blockDim.x] = d_in[index];
   __syncthreads();
   
   for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
@@ -104,19 +106,53 @@ void shmem_reduce_kernel(float * d_max_min_out, const float * d_in) {
     __syncthreads();
   }
 
-  if (s == 0) {
+  if (idx_in_block == 0) {
     d_max_min_out[blockIdx.x] = max_min_data[0];
     d_max_min_out[blockIdx.x + gridDim.x] = max_min_data[blockDim.x];
   }
 }
 
 __global__
+void shmem_global_reduce_kernel(float *d_max_min_out, const float *d_in) {
+  extern __shared__ float max_min_data[];
+  
+  int index = threadIdx.x + blockIdx.x * blockDim.x;
+  int idx_in_block = threadIdx.x;
+  
+  max_min_data[idx_in_block] = d_in[index];
+  max_min_data[idx_in_block + blockDim.x] = d_in[index + blockDim.x];
+  __syncthreads();
+  
+  int isOdd = 0;
+
+  for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (idx_in_block < s) {
+      max_min_data[idx_in_block] = fmaxf(max_min_data[idx_in_block], max_min_data[idx_in_block + s]);
+      max_min_data[idx_in_block + blockDim.x] = fminf(max_min_data[idx_in_block + blockDim.x], max_min_data[idx_in_block + blockDim.x + s]);
+      if (isOdd == 1 && idx_in_block == 0) {
+        isOdd = 0;
+        max_min_data[idx_in_block] = fmaxf(max_min_data[idx_in_block], max_min_data[idx_in_block + s + 1]);
+        max_min_data[idx_in_block + blockDim.x] = fminf(max_min_data[idx_in_block + blockDim.x], max_min_data[idx_in_block + blockDim.x + s + 1]);
+      }
+    }
+    if (s != 1 && s % 2 != 0) {
+      isOdd = 1;
+    }
+    __syncthreads();
+  }
+
+  if (idx_in_block == 0) {
+    d_max_min_out[blockIdx.x] = max_min_data[0];
+    d_max_min_out[blockIdx.x + gridDim.x] = max_min_data[blockDim.x];
+  }
+}
+
 void reduce(float * d_max_out,
             float * d_min_out,
-            float * d_max_min_intermediate,
-            float * d_in,
+            const float * d_in,
             int size) {
-  float d_max_min[2];
+  float * d_max_min;
+  checkCudaErrors(cudaMalloc((void **) &d_max_min, 2 * sizeof(float)));
   
   const int maxThreadsPerBlock = 1024;
   int threads = maxThreadsPerBlock;
@@ -124,63 +160,73 @@ void reduce(float * d_max_out,
   int blocks = size / maxThreadsPerBlock;
   assert(blocks != 0);
   assert(blocks % 2 == 0);
+
+  float *d_max_min_intermediate;
+  // size of intermediate array should be number of blocks
+  checkCudaErrors(cudaMalloc((void **) &d_max_min_intermediate, 2 * blocks * sizeof(float)));
+
   shmem_reduce_kernel<<<blocks, threads, 2 * threads * sizeof(float)>>>
-          (d_max_min_intermediate, d_in);
+          (d_max_min_intermediate, d_in, size);
   cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
     
   threads = blocks;
+  assert(threads <= 1024);
+  assert(threads <= 1024 * 6);
   blocks = 1;
-  shmem_reduce_kernel<<<blocks, threads, 2 * threads * sizeof(float)>>>
+  shmem_global_reduce_kernel<<<blocks, threads, 2 * threads * sizeof(float)>>>
           (d_max_min, d_max_min_intermediate);
   cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
 
   *d_max_out = d_max_min[0];
   *d_min_out = d_max_min[1];
-}
-
-__global__
-void find_max_and_min(float * d_in, float * global_max, float * global_min,
-                      size_t numRows, size_t numCols) {
-  const int ARRAY_SIZE = numRows * numCols;
-  const int ARRAY_BYTES = ARRAY_SIZE * sizeof(float);
-  float *d_max_min_intermediate;
-
-  checkCudaErrors(cudaMalloc((void **) &d_max_min_intermediate, 2 * ARRAY_BYTES));
-
-  reduce(global_max, global_min, d_max_min_intermediate, d_in, ARRAY_SIZE);
 
   checkCudaErrors(cudaFree(d_max_min_intermediate));
+  checkCudaErrors(cudaFree(d_max_min));
+}
+
+void find_max_and_min(const float * d_in, float * global_max, float * global_min,
+                      size_t numRows, size_t numCols) {
+  const int ARRAY_SIZE = numRows * numCols;
+  //const int ARRAY_BYTES = ARRAY_SIZE * sizeof(float);
+
+
+  reduce(global_max, global_min, d_in, ARRAY_SIZE);
 }
 
 __global__
-void scatter_kernel(const float *d_in, const size_t numBins,
-                    const float lumRange, int *d_bins, const float lumMin) {
+void scatter_kernel(const float *d_in, const size_t numBins, size,
+                    const float lumRange, unsigned int *d_bins, const float lumMin) {
   int myId = threadIdx.x + blockIdx.x * blockDim.x;
+  if (myId >= size) return;
   float myItem = d_in[myId];
-  unsigned int myBin = std::min(static_cast<unsigned int>(numBins - 1),
-                           static_cast<unsigned int>((myItem - lumMin) / lumRange * numBins));
+  unsigned int myBin = min((unsigned int) (numBins - 1), (unsigned int) ((myItem - lumMin) / lumRange * numBins));
   atomicAdd(&(d_bins[myBin]), 1);
 }
 
 __global__
-void init_bins(int *d_bins) {
+void init_bins(unsigned int *d_bins) {
   int myId = threadIdx.x + blockIdx.x * blockDim.x;
   d_bins[myId] = 0;
 }
 
-__global__
-void create_histos(int *d_bins, size_t numBins, float lumRange, float lumMin, float *d_in) {
+void create_histos(unsigned int *d_bins, size_t numBins, float lumRange, float lumMin, const float *d_in,
+                    size_t numRows, size_t numCols) {
 
-  init_bins<<<blocks, threads>>>(d_bins);
+  init_bins<<<1, numBins>>>(d_bins);
   cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
 
-  scatter_kernel<<<blocks, threads>>>(d_in, numBins, lumRange, d_bins, lumMin);
+  const int maxThreadsPerBlock = 1024;
+  int threads = maxThreadsPerBlock;
+  // if size is not divisible by maxThreadPerBlock, do I need an extra block
+  int size = numRows * numCols;
+  int blocks = size / maxThreadsPerBlock;  
+  scatter_kernel<<<blocks, threads>>>(d_in, numBins, size, lumRange, d_bins, lumMin);
   cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
 
 }
 
 __global__
-void exclusive_prefix_scan_kernel(const int* const d_in, int *d_out,
+void exclusive_prefix_scan_kernel(const unsigned int* const d_in, unsigned int *d_out,
                                   size_t threadsPerBlock) {
   extern __shared__ float sdata[];
 
@@ -204,6 +250,7 @@ void exclusive_prefix_scan_kernel(const int* const d_in, int *d_out,
   if (myId == threadsPerBlock - 1) {
     sdata[myId] = 0;
   }
+  __syncthreads();
 
   for (int s = threadsPerBlock / 2; s > 0; s >>= 1) {
     int base = s << 1;
@@ -221,10 +268,11 @@ void exclusive_prefix_scan_kernel(const int* const d_in, int *d_out,
 
 }
 
-__global__
-void ex_pre_scan(unsigned int* d_cdf, int *d_in, size_t numBins) {
+void ex_pre_scan(unsigned int* d_cdf, const unsigned int *d_in, size_t numBins) {
   // how do I assert that numBins == power of 2
-  exclusive_prefix_scan_kernel<<<1, numBins>>>(d_in, d_cdf, numBins);
+  assert(numBins <= 1024);
+  assert(numBins * sizeof(unsigned int) <= 4096 * 12);
+  exclusive_prefix_scan_kernel<<<1, numBins, numBins * sizeof(unsigned int)>>>(d_in, d_cdf, numBins);
   cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
 }
 
@@ -250,11 +298,11 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
 
   float lumRange = max_logLum - min_logLum;
 
-  int *d_bins;
+  unsigned int *d_bins;
 
-  checkCudaErrors(cudaMalloc((void **) &d_bins, numBins * sizeof(int)));
+  checkCudaErrors(cudaMalloc((void **) &d_bins, numBins * sizeof(unsigned int)));
 
-  create_histos(d_bins, numBins, lumRange, lumMin, d_logLuminance);
+  create_histos(d_bins, numBins, lumRange, min_logLum, d_logLuminance, numRows, numCols);
 
   ex_pre_scan(d_cdf, d_bins, numBins);
 
